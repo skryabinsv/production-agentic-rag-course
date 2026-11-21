@@ -114,10 +114,12 @@ async def ainvoke_guardrail_step(
     except Exception as e:
         logger.error(f"LLM guardrail validation failed: {e}, falling back to default")
 
-        # Fallback to a conservative default if LLM fails
+        # Fail open: previously the fallback score (50) was below the default threshold (60),
+        # so any LLM hiccup turned *every* question into an "out of scope" reply. Retrieval
+        # grading still guards against irrelevant answers downstream.
         response = GuardrailScoring(
-            score=50,
-            reason=f"LLM validation failed, using conservative default: {str(e)}"
+            score=runtime.context.guardrail_threshold,
+            reason=f"LLM validation failed, defaulting to in-scope: {type(e).__name__}",
         )
 
         # Update span with error

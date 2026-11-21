@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from opensearchpy import OpenSearch
 from src.config import Settings
 
-from .index_config_hybrid import ARXIV_PAPERS_CHUNKS_MAPPING, HYBRID_RRF_PIPELINE
+from .index_config_hybrid import HYBRID_RRF_PIPELINE, build_chunks_index_mapping
 from .query_builder import QueryBuilder
 
 logger = logging.getLogger(__name__)
@@ -20,12 +20,18 @@ class OpenSearchClient:
         self.settings = settings
         self.index_name = f"{settings.opensearch.index_name}-{settings.opensearch.chunk_index_suffix}"
 
-        self.client = OpenSearch(
-            hosts=[host],
-            use_ssl=False,
-            verify_certs=False,
-            ssl_show_warn=False,
-        )
+        os_settings = settings.opensearch
+        use_ssl = os_settings.use_ssl or host.startswith("https://")
+        client_kwargs = {
+            "hosts": [host],
+            "use_ssl": use_ssl,
+            # Certificates are verified whenever TLS is on (previously verification was always off)
+            "verify_certs": os_settings.verify_certs if use_ssl else False,
+            "ssl_show_warn": use_ssl,
+        }
+        if os_settings.username:
+            client_kwargs["http_auth"] = (os_settings.username, os_settings.password)
+        self.client = OpenSearch(**client_kwargs)
 
         logger.info(f"OpenSearch client initialized with host: {host}")
 
@@ -78,7 +84,11 @@ class OpenSearchClient:
                 logger.info(f"Deleted existing hybrid index: {self.index_name}")
 
             if not self.client.indices.exists(index=self.index_name):
-                self.client.indices.create(index=self.index_name, body=ARXIV_PAPERS_CHUNKS_MAPPING)
+                mapping = build_chunks_index_mapping(
+                    vector_dimension=self.settings.opensearch.vector_dimension,
+                    space_type=self.settings.opensearch.vector_space_type,
+                )
+                self.client.indices.create(index=self.index_name, body=mapping)
                 logger.info(f"Created hybrid index: {self.index_name}")
                 return True
 
@@ -102,21 +112,25 @@ class OpenSearchClient:
         """
         try:
             pipeline_id = HYBRID_RRF_PIPELINE["id"]
+            # NOTE: this is a *search* pipeline (/_search/pipeline), not an ingest pipeline.
+            # The previous implementation checked/deleted via the ingest API, so the
+            # existence check never matched and `force` deleted the wrong resource.
+            pipeline_path = f"/_search/pipeline/{pipeline_id}"
 
             if force:
                 try:
-                    self.client.ingest.get_pipeline(id=pipeline_id)
-                    self.client.ingest.delete_pipeline(id=pipeline_id)
+                    self.client.transport.perform_request("DELETE", pipeline_path)
                     logger.info(f"Deleted existing RRF pipeline: {pipeline_id}")
                 except Exception:
                     pass
+            else:
+                try:
+                    self.client.transport.perform_request("GET", pipeline_path)
+                    logger.info(f"RRF pipeline already exists: {pipeline_id}")
+                    return False
+                except Exception:
+                    pass
 
-            try:
-                self.client.ingest.get_pipeline(id=pipeline_id)
-                logger.info(f"RRF pipeline already exists: {pipeline_id}")
-                return False
-            except Exception:
-                pass
             pipeline_body = {
                 "description": HYBRID_RRF_PIPELINE["description"],
                 "phase_results_processors": HYBRID_RRF_PIPELINE["phase_results_processors"],
@@ -257,7 +271,14 @@ class OpenSearchClient:
 
         bm25_query = bm25_search_body["query"]
 
-        hybrid_query = {"hybrid": {"queries": [bm25_query, {"knn": {"embedding": {"vector": query_embedding, "k": size * 2}}}]}}
+        knn_query: Dict[str, Any] = {"knn": {"embedding": {"vector": query_embedding, "k": size * 2}}}
+        if categories:
+            # The category filter used to be applied to the BM25 branch only, so the vector
+            # branch leaked chunks from other categories into the fused results.
+            # A bool post-filter works with every k-NN engine (nmslib has no native filter).
+            knn_query = {"bool": {"must": [knn_query], "filter": [{"terms": {"categories": categories}}]}}
+
+        hybrid_query = {"hybrid": {"queries": [bm25_query, knn_query]}}
 
         search_body = {
             "size": size,
@@ -336,6 +357,12 @@ class OpenSearchClient:
                 chunk_data["embedding"] = chunk["embedding"]
 
                 action = {"_index": self.index_name, "_source": chunk_data}
+                # Deterministic document id => re-indexing the same paper overwrites its chunks
+                # instead of silently creating duplicates.
+                arxiv_id = chunk_data.get("arxiv_id")
+                chunk_index = chunk_data.get("chunk_index")
+                if arxiv_id is not None and chunk_index is not None:
+                    action["_id"] = f"{arxiv_id}_{chunk_index}"
                 actions.append(action)
 
             success, failed = helpers.bulk(self.client, actions, refresh=True)

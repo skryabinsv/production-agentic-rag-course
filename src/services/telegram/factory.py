@@ -13,6 +13,7 @@ def make_telegram_service(
     ollama_client,
     cache_client=None,
     langfuse_tracer=None,
+    retriever=None,
 ) -> Optional[TelegramBot]:
     """
     Create Telegram bot if enabled.
@@ -43,6 +44,10 @@ def make_telegram_service(
         embeddings_client=embeddings_client,
         ollama_client=ollama_client,
         cache_client=cache_client,
+        model=settings.ollama_model,
+        allowed_user_ids=settings.telegram.allowed_user_id_set,
+        allow_public=settings.telegram.allow_public is True,
+        retriever=retriever,
     )
 
     logger.info("Telegram bot created successfully")

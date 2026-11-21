@@ -97,7 +97,14 @@ async def ainvoke_retrieve_step(
                 {
                     "id": f"retrieve_{new_attempt_count}",
                     "name": "retrieve_papers",
-                    "args": {"query": question},
+                    # Per-request retrieval parameters travel with the tool call, so the
+                    # graph can be compiled once and reused across requests.
+                    "args": {
+                        "query": question,
+                        "top_k": runtime.context.top_k,
+                        "use_hybrid": runtime.context.use_hybrid,
+                        "categories": runtime.context.categories,
+                    },
                 }
             ],
         )

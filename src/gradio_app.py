@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Iterator
 
 import gradio as gr
@@ -8,7 +9,9 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # Configuration
-API_BASE_URL = "http://localhost:8000/api/v1"
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000/api/v1")
+# Needed when the API is protected with API_KEYS (send one of the keys)
+API_KEY = os.getenv("API_KEY", "")
 DEFAULT_MODEL = "llama3.2:1b"
 AVAILABLE_CATEGORIES = ["cs.AI", "cs.LG"]
 
@@ -30,7 +33,10 @@ async def stream_response(
     try:
         url = f"{API_BASE_URL}/stream"
         async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream("POST", url, json=payload, headers={"Accept": "text/plain"}) as response:
+            headers = {"Accept": "text/event-stream"}
+            if API_KEY:
+                headers["X-API-Key"] = API_KEY
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
                 if response.status_code != 200:
                     yield f"Error: API returned status {response.status_code}"
                     return

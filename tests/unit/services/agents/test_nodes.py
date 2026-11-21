@@ -1,20 +1,22 @@
 """Tests for agentic RAG node functions using Runtime[Context] pattern."""
 
-import pytest
 from unittest.mock import AsyncMock, Mock
+
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
-
+from src.services.agents.models import GradeDocuments, GuardrailScoring
 from src.services.agents.nodes import (
-    ainvoke_retrieve_step,
-    ainvoke_grade_documents_step,
-    ainvoke_rewrite_query_step,
     ainvoke_generate_answer_step,
+    ainvoke_grade_documents_step,
+    ainvoke_guardrail_step,
     ainvoke_out_of_scope_step,
+    ainvoke_retrieve_step,
+    ainvoke_rewrite_query_step,
     continue_after_guardrail,
 )
-from src.services.agents.nodes.utils import get_latest_query, get_latest_context
-from src.services.agents.models import GuardrailScoring, GradeDocuments
+from src.services.agents.nodes.rewrite_query_node import QueryRewriteOutput
+from src.services.agents.nodes.utils import get_latest_context, get_latest_query
 from src.services.agents.state import AgentState
 
 
@@ -102,7 +104,8 @@ class TestGradeDocumentsNode:
             binary_score="yes",
             reasoning="Document discusses transformers which is relevant"
         ))
-        test_context.ollama_client.create_llm = Mock(return_value=mock_llm)
+        mock_llm.with_structured_output = Mock(return_value=mock_llm)
+        test_context.ollama_client.get_langchain_model = Mock(return_value=mock_llm)
 
         state: AgentState = {
             "messages": [sample_human_message, sample_tool_message],
@@ -114,6 +117,10 @@ class TestGradeDocumentsNode:
         result = await ainvoke_grade_documents_step(state, runtime)
 
         assert "grading_results" in result
+        assert result["routing_decision"] == "generate_answer"
+        assert result["grading_results"][0].is_relevant is True
+        # Sources come from the retrieval artefact (previously always empty)
+        assert [src.arxiv_id for src in result["relevant_sources"]] == ["1706.03762"]
 
     @pytest.mark.asyncio
     async def test_grade_documents_not_relevant(self, test_context, sample_human_message, sample_tool_message):
@@ -123,7 +130,8 @@ class TestGradeDocumentsNode:
             binary_score="no",
             reasoning="Document is not relevant to the query"
         ))
-        test_context.ollama_client.create_llm = Mock(return_value=mock_llm)
+        mock_llm.with_structured_output = Mock(return_value=mock_llm)
+        test_context.ollama_client.get_langchain_model = Mock(return_value=mock_llm)
 
         state: AgentState = {
             "messages": [sample_human_message, sample_tool_message],
@@ -135,6 +143,8 @@ class TestGradeDocumentsNode:
         result = await ainvoke_grade_documents_step(state, runtime)
 
         assert "grading_results" in result
+        assert result["routing_decision"] == "rewrite_query"
+        assert result["relevant_sources"] == []
 
 
 class TestRewriteQueryNode:
@@ -144,10 +154,12 @@ class TestRewriteQueryNode:
     async def test_rewrite_query_success(self, test_context, sample_human_message):
         """Test query rewriting with LLM."""
         mock_llm = Mock()
-        mock_llm.ainvoke = AsyncMock(return_value=Mock(
-            content="What are the key concepts in transformer neural network architectures?"
+        mock_llm.ainvoke = AsyncMock(return_value=QueryRewriteOutput(
+            rewritten_query="What are the key concepts in transformer neural network architectures?",
+            reasoning="Added specific technical terms",
         ))
-        test_context.ollama_client.create_llm = Mock(return_value=mock_llm)
+        mock_llm.with_structured_output = Mock(return_value=mock_llm)
+        test_context.ollama_client.get_langchain_model = Mock(return_value=mock_llm)
 
         state: AgentState = {
             "messages": [sample_human_message],
@@ -162,6 +174,7 @@ class TestRewriteQueryNode:
         assert isinstance(result["messages"][0], HumanMessage)
         assert len(result["messages"][0].content) > 0
         assert "rewritten_query" in result
+        assert result["rewritten_query"] == "What are the key concepts in transformer neural network architectures?"
 
 
 class TestGenerateAnswerNode:
@@ -174,7 +187,8 @@ class TestGenerateAnswerNode:
         mock_llm.ainvoke = AsyncMock(return_value=Mock(
             content="Based on the papers, transformers are neural network architectures."
         ))
-        test_context.ollama_client.create_llm = Mock(return_value=mock_llm)
+        mock_llm.with_structured_output = Mock(return_value=mock_llm)
+        test_context.ollama_client.get_langchain_model = Mock(return_value=mock_llm)
 
         state: AgentState = {
             "messages": [sample_human_message, sample_tool_message],
@@ -189,6 +203,44 @@ class TestGenerateAnswerNode:
         assert isinstance(result["messages"][0], AIMessage)
         assert len(result["messages"][0].content) > 0
 
+    @pytest.mark.asyncio
+    async def test_generate_answer_uses_original_question(self, test_context, mock_llm, sample_tool_message):
+        """After a rewrite the answer must target the user's question, not the retrieval rewrite."""
+        mock_llm.ainvoke = AsyncMock(return_value=AIMessage(content="answer"))
+        state: AgentState = {
+            "messages": [
+                HumanMessage(content="ML stuff?"),
+                HumanMessage(content="key concepts of machine learning research"),
+                sample_tool_message,
+            ],
+            "original_query": "ML stuff?",
+            "retrieval_attempts": 2,
+        }
+        runtime = Mock(spec=Runtime)
+        runtime.context = test_context
+
+        await ainvoke_generate_answer_step(state, runtime)
+
+        prompt = mock_llm.ainvoke.call_args.args[0]
+        assert "User Question: ML stuff?" in prompt
+        assert "key concepts of machine learning research" not in prompt
+
+
+class TestGuardrailFallback:
+    """The guardrail must not reject every query when the LLM call fails."""
+
+    @pytest.mark.asyncio
+    async def test_guardrail_llm_failure_fails_open(self, test_context, mock_llm, sample_human_message):
+        mock_llm.ainvoke = AsyncMock(side_effect=RuntimeError("ollama down"))
+        state: AgentState = {"messages": [sample_human_message], "retrieval_attempts": 0}
+        runtime = Mock(spec=Runtime)
+        runtime.context = test_context
+
+        result = await ainvoke_guardrail_step(state, runtime)
+        state["guardrail_result"] = result["guardrail_result"]
+
+        assert continue_after_guardrail(state, runtime) == "continue"
+
 
 class TestOutOfScopeNode:
     """Tests for out-of-scope handling node."""
@@ -200,7 +252,8 @@ class TestOutOfScopeNode:
         mock_llm.ainvoke = AsyncMock(return_value=Mock(
             content="I'm designed to help with AI research papers."
         ))
-        test_context.ollama_client.create_llm = Mock(return_value=mock_llm)
+        mock_llm.with_structured_output = Mock(return_value=mock_llm)
+        test_context.ollama_client.get_langchain_model = Mock(return_value=mock_llm)
 
         state: AgentState = {
             "messages": [sample_human_message],

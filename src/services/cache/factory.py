@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 import redis
 from src.config import Settings
@@ -37,13 +38,17 @@ def make_redis_client(settings: Settings) -> redis.Redis:
         raise
 
 
-def make_cache_client(settings: Settings) -> CacheClient:
-    """Create exact match cache client."""
+def make_cache_client(settings: Settings) -> Optional[CacheClient]:
+    """Create exact match cache client.
+
+    Caching is an optimisation, not a dependency: if Redis is unreachable the API must
+    still start and serve uncached answers (previously the exception aborted startup).
+    """
     try:
         redis_client = make_redis_client(settings)
         cache_client = CacheClient(redis_client, settings.redis)
         logger.info("Exact match cache client created successfully")
         return cache_client
     except Exception as e:
-        logger.error(f"Failed to create cache client: {e}")
-        raise
+        logger.warning(f"Cache disabled - failed to create cache client: {e}")
+        return None

@@ -5,9 +5,11 @@ from typing import Dict, List
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from src.dependencies import CacheDep, EmbeddingsDep, LangfuseDep, OllamaDep, OpenSearchDep
+from src.dependencies import CacheDep, LangfuseDep, OllamaDep, RetrieverDep, SettingsDep
+from src.routers.common import ensure_model_allowed
 from src.schemas.api.ask import AskRequest, AskResponse
 from src.services.langfuse.tracer import RAGTracer
+from src.utils.arxiv import arxiv_pdf_url
 
 logger = logging.getLogger(__name__)
 
@@ -18,43 +20,43 @@ stream_router = APIRouter(tags=["stream"])
 
 async def _prepare_chunks_and_sources(
     request: AskRequest,
-    opensearch_client,
-    embeddings_service,
+    retriever,
     rag_tracer: RAGTracer,
     trace=None,
-) -> tuple[List[Dict], List[str], List[str]]:
-    """Retrieve and prepare chunks for RAG with clean tracing."""
+) -> tuple[List[Dict], List[str], List[str], str]:
+    """Retrieve (and optionally rerank) chunks for RAG with clean tracing.
+
+    Returns ``(chunks, sources, arxiv_ids, search_mode)``; ``search_mode`` reflects what actually
+    ran (hybrid silently degrades to BM25 when embeddings fail).
+    """
 
     # Handle embeddings for hybrid search
     query_embedding = None
     if request.use_hybrid:
         with rag_tracer.trace_embedding(trace, request.query) as embedding_span:
-            try:
-                query_embedding = await embeddings_service.embed_query(request.query)
-                logger.info("Generated query embedding for hybrid search")
-            except Exception as e:
-                logger.warning(f"Failed to generate embeddings, falling back to BM25: {e}")
-                if embedding_span:
-                    rag_tracer.tracer.update_span(embedding_span, output={"success": False, "error": str(e)})
+            query_embedding = await retriever.embed_query(request.query)
+            if query_embedding is None and embedding_span:
+                rag_tracer.tracer.update_span(embedding_span, output={"success": False, "fallback": "bm25"})
 
-    # Search with tracing
+    # Search with tracing (blocking OpenSearch call runs in a worker thread)
     with rag_tracer.trace_search(trace, request.query, request.top_k) as search_span:
-        search_results = opensearch_client.search_unified(
+        search_results = await retriever.search(
             query=request.query,
             query_embedding=query_embedding,
-            size=request.top_k,
-            from_=0,
+            size=retriever.fetch_size(request.top_k, rerank=True),
             categories=request.categories,
-            use_hybrid=request.use_hybrid and query_embedding is not None,
+            use_hybrid=request.use_hybrid,
+            from_=0,
             min_score=0.0,
         )
+        hits, _reranked = await retriever.rerank(request.query, search_results.get("hits", []), request.top_k)
 
         # Extract essential data for LLM
         chunks = []
         arxiv_ids = []
-        sources_set = set()
+        sources: List[str] = []  # ordered by rank, de-duplicated
 
-        for hit in search_results.get("hits", []):
+        for hit in hits:
             arxiv_id = hit.get("arxiv_id", "")
 
             # Minimal chunk data for LLM
@@ -67,26 +69,29 @@ async def _prepare_chunks_and_sources(
 
             if arxiv_id:
                 arxiv_ids.append(arxiv_id)
-                arxiv_id_clean = arxiv_id.split("v")[0] if "v" in arxiv_id else arxiv_id
-                sources_set.add(f"https://arxiv.org/pdf/{arxiv_id_clean}.pdf")
+                pdf_url = arxiv_pdf_url(arxiv_id)
+                if pdf_url not in sources:
+                    sources.append(pdf_url)
 
         # End search span with essential metadata
         rag_tracer.end_search(search_span, chunks, arxiv_ids, search_results.get("total", 0))
 
-    return chunks, list(sources_set), arxiv_ids
+    search_mode = "hybrid" if query_embedding is not None else "bm25"
+    return chunks, sources, arxiv_ids, search_mode
 
 
 @ask_router.post("/ask", response_model=AskResponse)
 async def ask_question(
     request: AskRequest,
-    opensearch_client: OpenSearchDep,
-    embeddings_service: EmbeddingsDep,
+    retriever: RetrieverDep,
     ollama_client: OllamaDep,
     langfuse_tracer: LangfuseDep,
     cache_client: CacheDep,
+    settings: SettingsDep,
 ) -> AskResponse:
     """Clean RAG endpoint with essential tracing and exact match caching."""
 
+    ensure_model_allowed(request.model, settings)
     rag_tracer = RAGTracer(langfuse_tracer)
     start_time = time.time()
 
@@ -103,13 +108,8 @@ async def ask_question(
                 except Exception as e:
                     logger.warning(f"Cache check failed, proceeding with normal flow: {e}")
 
-            # Generate query embedding for hybrid search if needed
-            query_embedding = None
-
             # Retrieve chunks
-            chunks, sources, _ = await _prepare_chunks_and_sources(
-                request, opensearch_client, embeddings_service, rag_tracer, trace
-            )
+            chunks, sources, _, search_mode = await _prepare_chunks_and_sources(request, retriever, rag_tracer, trace)
 
             if not chunks:
                 response = AskResponse(
@@ -117,7 +117,7 @@ async def ask_question(
                     answer="I couldn't find any relevant information in the papers to answer your question.",
                     sources=[],
                     chunks_used=0,
-                    search_mode="bm25" if not request.use_hybrid else "hybrid",
+                    search_mode=search_mode,
                 )
                 rag_tracer.end_request(trace, response.answer, time.time() - start_time)
                 return response
@@ -148,7 +148,7 @@ async def ask_question(
                 answer=answer,
                 sources=sources,
                 chunks_used=len(chunks),
-                search_mode="bm25" if not request.use_hybrid else "hybrid",
+                search_mode=search_mode,
             )
 
             rag_tracer.end_request(trace, answer, time.time() - start_time)
@@ -162,21 +162,26 @@ async def ask_question(
 
             return response
 
-        except Exception as e:
-            logger.error(f"Error processing request: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        except HTTPException:
+            raise
+        except Exception:
+            # Log the full error server-side; don't leak internals (hosts, stack details) to clients.
+            logger.exception("Error processing /ask request")
+            raise HTTPException(status_code=500, detail="Internal error while answering the question")
 
 
 @stream_router.post("/stream")
 async def ask_question_stream(
     request: AskRequest,
-    opensearch_client: OpenSearchDep,
-    embeddings_service: EmbeddingsDep,
+    retriever: RetrieverDep,
     ollama_client: OllamaDep,
     langfuse_tracer: LangfuseDep,
     cache_client: CacheDep,
+    settings: SettingsDep,
 ) -> StreamingResponse:
-    """Clean streaming RAG endpoint."""
+    """Clean streaming RAG endpoint (Server-Sent Events)."""
+
+    ensure_model_allowed(request.model, settings)
 
     async def generate_stream():
         rag_tracer = RAGTracer(langfuse_tracer)
@@ -210,16 +215,13 @@ async def ask_question_stream(
                         logger.warning(f"Cache check failed, proceeding with normal flow: {e}")
 
                 # Retrieve chunks
-                chunks, sources, _ = await _prepare_chunks_and_sources(
-                    request, opensearch_client, embeddings_service, rag_tracer, trace
-                )
+                chunks, sources, _, search_mode = await _prepare_chunks_and_sources(request, retriever, rag_tracer, trace)
 
                 if not chunks:
                     yield f"data: {json.dumps({'answer': 'No relevant information found.', 'sources': [], 'done': True})}\n\n"
                     return
 
                 # Send metadata first
-                search_mode = "bm25" if not request.use_hybrid else "hybrid"
                 metadata_response = {"sources": sources, "chunks_used": len(chunks), "search_mode": search_mode}
                 yield f"data: {json.dumps(metadata_response)}\n\n"
 
@@ -252,7 +254,6 @@ async def ask_question_stream(
                 # Store response in exact match cache
                 if cache_client and full_response:
                     try:
-                        search_mode = "bm25" if not request.use_hybrid else "hybrid"
                         response_to_cache = AskResponse(
                             query=request.query,
                             answer=full_response,
@@ -264,10 +265,14 @@ async def ask_question_stream(
                     except Exception as e:
                         logger.warning(f"Failed to store streaming response in cache: {e}")
 
-            except Exception as e:
-                logger.error(f"Streaming error: {e}")
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            except Exception:
+                logger.exception("Streaming error")
+                yield f"data: {json.dumps({'error': 'Internal error while generating the answer'})}\n\n"
 
+    # The body is SSE-framed ("data: ...\n\n"), so advertise it as such: browsers' EventSource
+    # and proxies (e.g. nginx buffering) rely on the text/event-stream content type.
     return StreamingResponse(
-        generate_stream(), media_type="text/plain", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        generate_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )

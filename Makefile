@@ -1,4 +1,4 @@
-.PHONY: help start stop restart status logs health setup format lint test test-cov clean
+.PHONY: help start stop restart status logs health setup format lint test test-cov eval eval-answers clean
 
 # Default target
 help: ## Show this help message
@@ -24,7 +24,7 @@ logs: ## Show service logs
 # Health checks
 health: ## Check all services health
 	@echo "Checking service health..."
-	@curl -s http://localhost:8000/health | jq . || echo "API not responding"
+	@curl -s http://localhost:8000/api/v1/health | jq . || echo "API not responding"
 	@curl -s http://localhost:9200/_cluster/health | jq . || echo "OpenSearch not responding"
 	@curl -s http://localhost:8080/api/v2/monitor/health || echo "Airflow not responding"
 	@curl -s http://localhost:11434/api/version | jq . || echo "Ollama not responding"
@@ -45,6 +45,13 @@ test: ## Run tests
 
 test-cov: ## Run tests with coverage
 	uv run pytest --cov=src --cov-report=html
+
+GOLDEN ?= evals/golden_set.example.jsonl
+eval: ## Evaluate retrieval quality (GOLDEN=path/to/set.jsonl)
+	uv run python scripts/evaluate_retrieval.py --golden $(GOLDEN)
+
+eval-answers: ## Evaluate generated answers: citations, refusals (+ JUDGE=ollama-model for faithfulness)
+	uv run python scripts/evaluate_answers.py --golden $(GOLDEN) $(if $(JUDGE),--judge-model $(JUDGE),)
 
 # Cleanup
 clean: ## Clean up everything

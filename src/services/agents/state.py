@@ -53,6 +53,10 @@ class AgentState(TypedDict):
         List of grading results for each retrieved document.
     :type grading_results: List[GradingResult]
 
+    :cvar relevant_context:
+        Context built only from documents graded relevant (used for answer generation).
+    :type relevant_context: Optional[str]
+
     :cvar metadata:
         Runtime metadata for tracing and analytics.
     :type metadata: Dict[str, Any]
@@ -68,4 +72,5 @@ class AgentState(TypedDict):
     relevant_sources: List[SourceItem]
     relevant_tool_artefacts: Optional[List[ToolArtefact]]
     grading_results: List[GradingResult]
+    relevant_context: Optional[str]
     metadata: Dict[str, Any]

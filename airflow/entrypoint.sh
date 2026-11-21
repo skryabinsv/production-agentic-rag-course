@@ -15,7 +15,7 @@ sleep 2
 echo "Initializing Airflow database..."
 airflow db init
 
-# Create admin user with admin/admin credentials
+# Create admin user (password from AIRFLOW_ADMIN_PASSWORD, default "admin" for local use)
 echo "Creating admin user..."
 airflow users create \
     --username admin \
@@ -23,7 +23,7 @@ airflow users create \
     --lastname User \
     --role Admin \
     --email admin@example.com \
-    --password admin || echo "Admin user already exists"
+    --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" || echo "Admin user already exists"
 
 # Start webserver and scheduler
 echo "Starting Airflow webserver and scheduler..."

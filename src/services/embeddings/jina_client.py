@@ -22,6 +22,7 @@ class JinaEmbeddingsClient:
         """
         self.api_key = api_key
         self.base_url = base_url
+        self.model_name = "jina-embeddings-v3"
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",

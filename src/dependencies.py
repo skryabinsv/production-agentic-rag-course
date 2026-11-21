@@ -13,16 +13,18 @@ else:
 
 from src.config import Settings
 from src.db.interfaces.base import BaseDatabase
+from src.services.agents.agentic_rag import AgenticRAGService
+from src.services.agents.factory import make_agentic_rag_service
 from src.services.arxiv.client import ArxivClient
 from src.services.cache.client import CacheClient
 from src.services.embeddings.jina_client import JinaEmbeddingsClient
 from src.services.langfuse.client import LangfuseTracer
+from src.services.memory import ConversationMemory
 from src.services.ollama.client import OllamaClient
 from src.services.opensearch.client import OpenSearchClient
 from src.services.pdf_parser.parser import PDFParserService
+from src.services.retrieval import Retriever
 from src.services.telegram.bot import TelegramBot
-from src.services.agents.agentic_rag import AgenticRAGService
-from src.services.agents.factory import make_agentic_rag_service
 
 
 @lru_cache
@@ -82,9 +84,35 @@ def get_cache_client(request: Request) -> CacheClient | None:
     return getattr(request.app.state, "cache_client", None)
 
 
+def get_retriever(request: Request) -> Retriever:
+    """Shared retrieval path (embedding + BM25 fallback, threaded OpenSearch, optional reranking)."""
+    retriever = getattr(request.app.state, "retriever", None)
+    if retriever is None:
+        retriever = Retriever(request.app.state.opensearch_client, request.app.state.embeddings_service)
+        request.app.state.retriever = retriever
+    return retriever
+
+
+def get_conversation_memory(request: Request) -> Optional[ConversationMemory]:
+    """Conversation memory for multi-turn agentic chat (None when disabled)."""
+    return getattr(request.app.state, "conversation_memory", None)
+
+
 def get_telegram_service(request: Request) -> Optional[TelegramBot]:
     """Get Telegram service from the request state."""
     return getattr(request.app.state, "telegram_service", None)
+
+
+def protect_api(request: Request, settings: Annotated[Settings, Depends(get_settings)]) -> None:
+    """API-key authentication + rate limiting for /api/v1 endpoints (both opt-in via settings).
+
+    Declared sync on purpose: FastAPI runs it in the threadpool, so the Redis round-trip of
+    the rate limiter does not block the event loop.
+    """
+    from src.security import enforce_rate_limit, verify_api_key
+
+    api_key = verify_api_key(request, settings)
+    enforce_rate_limit(request, settings, api_key)
 
 
 # Dependency annotations
@@ -99,23 +127,37 @@ OllamaDep = Annotated[OllamaClient, Depends(get_ollama_client)]
 LangfuseDep = Annotated[LangfuseTracer, Depends(get_langfuse_tracer)]
 CacheDep = Annotated[CacheClient | None, Depends(get_cache_client)]
 TelegramDep = Annotated[Optional[TelegramBot], Depends(get_telegram_service)]
+RetrieverDep = Annotated[Retriever, Depends(get_retriever)]
+ConversationMemoryDep = Annotated[Optional[ConversationMemory], Depends(get_conversation_memory)]
 
 
 def get_agentic_rag_service(
+    request: Request,
     opensearch: OpenSearchDep,
     ollama: OllamaDep,
     embeddings: EmbeddingsDep,
     langfuse: LangfuseDep,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> AgenticRAGService:
-    """Get agentic RAG service."""
-    return make_agentic_rag_service(
-        opensearch_client=opensearch,
-        ollama_client=ollama,
-        embeddings_client=embeddings,
-        langfuse_tracer=langfuse,
-        model=settings.ollama_model,
-    )
+    """Get the agentic RAG service.
+
+    The LangGraph workflow is compiled once per process and cached on ``app.state``
+    (previously it was rebuilt on every request). Per-request knobs (model, top_k,
+    hybrid, categories) are passed to ``AgenticRAGService.ask`` instead.
+    """
+    service = getattr(request.app.state, "agentic_rag_service", None)
+    if service is None:
+        service = make_agentic_rag_service(
+            opensearch_client=opensearch,
+            ollama_client=ollama,
+            embeddings_client=embeddings,
+            langfuse_tracer=langfuse,
+            model=settings.ollama_model,
+            reranker=getattr(request.app.state, "reranker", None),
+            rerank_candidates=settings.reranker.candidates,
+        )
+        request.app.state.agentic_rag_service = service
+    return service
 
 
 AgenticRAGDep = Annotated[AgenticRAGService, Depends(get_agentic_rag_service)]

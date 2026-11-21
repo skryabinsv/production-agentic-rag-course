@@ -1,10 +1,10 @@
-import pytest
-from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+from fastapi.testclient import TestClient
+from src import dependencies
 from src.main import app
 from src.services.agents.agentic_rag import AgenticRAGService
-from src import dependencies
 
 
 @pytest.fixture
@@ -230,3 +230,36 @@ class TestAgenticAskEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["search_mode"] == "bm25"
+
+
+def test_ask_agentic_session_passes_history_on_follow_up(mock_agentic_rag_service):
+    """Same session_id on consecutive requests -> the second call receives the first turn as history."""
+    from src.services.memory import ConversationMemory
+
+    memory = ConversationMemory()
+    app.dependency_overrides[dependencies.get_agentic_rag_service] = lambda: mock_agentic_rag_service
+    app.dependency_overrides[dependencies.get_conversation_memory] = lambda: memory
+    try:
+        client = TestClient(app)
+        first = client.post("/api/v1/ask-agentic", json={"query": "What is LoRA?", "session_id": "chat-1"})
+        assert first.status_code == 200
+        assert "history" not in mock_agentic_rag_service.ask.call_args.kwargs
+
+        mock_agentic_rag_service.ask.return_value = {
+            **mock_agentic_rag_service.ask.return_value,
+            "standalone_query": "What are the limitations of LoRA?",
+        }
+        second = client.post("/api/v1/ask-agentic", json={"query": "and its limitations?", "session_id": "chat-1"})
+
+        assert second.status_code == 200
+        history = mock_agentic_rag_service.ask.call_args.kwargs["history"]
+        assert [turn.question for turn in history] == ["What is LoRA?"]
+        assert second.json()["standalone_query"] == "What are the limitations of LoRA?"
+        assert second.json()["session_id"] == "chat-1"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_ask_agentic_rejects_malformed_session_id(client):
+    response = client.post("/api/v1/ask-agentic", json={"query": "q", "session_id": "bad id with spaces"})
+    assert response.status_code == 422

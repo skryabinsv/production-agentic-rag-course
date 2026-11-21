@@ -8,7 +8,7 @@ from langgraph.runtime import Runtime
 from ..context import Context
 from ..prompts import GENERATE_ANSWER_PROMPT
 from ..state import AgentState
-from .utils import get_latest_context, get_latest_query
+from .utils import get_latest_context, get_original_query
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +29,10 @@ async def ainvoke_generate_answer_step(
     logger.info("NODE: generate_answer")
     start_time = time.time()
 
-    # Get question and context
-    question = get_latest_query(state["messages"])
-    context = get_latest_context(state["messages"])
+    # Answer the user's original question; a rewritten query is only a retrieval aid
+    question = get_original_query(state)
+    # Prefer the context made of documents graded relevant; fall back to the raw retrieval
+    context = state.get("relevant_context") or get_latest_context(state["messages"])
 
     # Count sources from relevant_sources
     sources_count = len(state.get("relevant_sources", []))

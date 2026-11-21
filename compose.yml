@@ -1,10 +1,19 @@
+# Security notes:
+# - Every published port is bound to 127.0.0.1 (previously 0.0.0.0). Containers still talk to
+#   each other over `rag-network`.
+# - All passwords come from .env (see .env.example). The defaults equal the old hard-coded
+#   values so existing volumes keep working - change them for any non-local deployment
+#   (Postgres/ClickHouse passwords must be set before the first start of their volume).
+# - OpenSearch runs with its security plugin disabled (dev convenience, localhost only).
+#   For a reachable deployment enable it and set OPENSEARCH__USERNAME/PASSWORD/USE_SSL.
+# - To expose the API, change "127.0.0.1:8000:8000" and set API_KEYS (+ RATE_LIMIT_PER_MINUTE).
 services:
   # API service
   api:
     build: .
     container_name: rag-api
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -25,7 +34,7 @@ services:
       - OPENSEARCH_HOST=http://opensearch:9200
       - OPENSEARCH__HOST=http://opensearch:9200
       - OLLAMA_HOST=http://ollama:11434
-      - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
+      - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag_db
       - LANGFUSE_HOST=http://langfuse-web:3000 
       - LANGFUSE_DEBUG=true
       - REDIS__HOST=redis
@@ -36,12 +45,17 @@ services:
     image: redis:7-alpine
     container_name: rag-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    environment:
+      # Same variable the API uses (REDIS__PASSWORD in .env); empty = no password (legacy)
+      - REDIS_PASSWORD=${REDIS__PASSWORD:-}
+    command: >
+      sh -c 'exec redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+      $${REDIS_PASSWORD:+--requirepass "$$REDIS_PASSWORD"}'
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli $${REDIS_PASSWORD:+-a \"$$REDIS_PASSWORD\"} --no-auth-warning ping | grep -q PONG"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -59,8 +73,8 @@ services:
       - DISABLE_SECURITY_PLUGIN=true
       - bootstrap.memory_lock=true
     ports:
-      - "9200:9200"
-      - "9600:9600"
+      - "127.0.0.1:9200:9200"
+      - "127.0.0.1:9600:9600"
     ulimits:
       memlock:
         soft: -1
@@ -81,7 +95,7 @@ services:
     image: opensearchproject/opensearch-dashboards:2.19.0
     container_name: rag-dashboards
     ports:
-      - "5601:5601"
+      - "127.0.0.1:5601:5601"
     environment:
       - OPENSEARCH_HOSTS=http://opensearch:9200
       - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
@@ -112,18 +126,20 @@ services:
       - AIRFLOW_HOME=/opt/airflow
       - PYTHONPATH=/opt/airflow/src
       # Container hostnames for Airflow
-      - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:rag_password@postgres:5432/rag_db
+      - POSTGRES_DATABASE_URL=postgresql+psycopg2://rag_user:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag_db
       - OPENSEARCH_HOST=http://opensearch:9200
       - OPENSEARCH__HOST=http://opensearch:9200
       - OLLAMA_HOST=http://ollama:11434
       - REDIS__HOST=redis
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://rag_user:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag_db
+      - AIRFLOW_ADMIN_PASSWORD=${AIRFLOW_ADMIN_PASSWORD:-admin}
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - airflow_logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
       - ./src:/opt/airflow/src
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     # Command handled by entrypoint.sh
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -138,7 +154,7 @@ services:
     image: ollama/ollama:0.11.2
     container_name: rag-ollama
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
@@ -156,11 +172,12 @@ services:
     environment:
       - POSTGRES_DB=rag_db
       - POSTGRES_USER=rag_user
-      - POSTGRES_PASSWORD=rag_password
+      # Set POSTGRES_PASSWORD in .env BEFORE the first start (it is applied when the volume is initialised)
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rag_password}
       - POSTGRES_HOST_AUTH_METHOD=password
       - PGDATA=/var/lib/postgresql/data/pgdata
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -181,7 +198,7 @@ services:
       - CLICKHOUSE_DB=langfuse
       - CLICKHOUSE_USER=langfuse
       - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
-      - CLICKHOUSE_PASSWORD=langfuse
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-langfuse}
     volumes:
       - clickhouse_data:/var/lib/clickhouse
     healthcheck:
@@ -208,10 +225,10 @@ services:
       clickhouse:
         condition: service_healthy
     ports:
-      - "3030:3030"
+      - "127.0.0.1:3030:3030"
     environment:
       NEXTAUTH_URL: http://localhost:3001
-      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      DATABASE_URL: postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD:-langfuse}@langfuse-postgres:5432/langfuse
       # Security: Load sensitive values from .env file
       SALT: ${LANGFUSE_SALT}
       ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
@@ -220,7 +237,7 @@ services:
       CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_USER: langfuse
-      CLICKHOUSE_PASSWORD: langfuse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-langfuse}
       CLICKHOUSE_CLUSTER_ENABLED: "false"
       LANGFUSE_USE_AZURE_BLOB: "false"
       LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
@@ -258,12 +275,12 @@ services:
       clickhouse:
         condition: service_healthy
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     environment:
       NEXTAUTH_URL: http://localhost:3001
       # Security: Load sensitive values from .env file
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
-      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      DATABASE_URL: postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD:-langfuse}@langfuse-postgres:5432/langfuse
       SALT: ${LANGFUSE_SALT}
       ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
       TELEMETRY_ENABLED: "false"
@@ -271,7 +288,7 @@ services:
       CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_USER: langfuse
-      CLICKHOUSE_PASSWORD: langfuse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-langfuse}
       CLICKHOUSE_CLUSTER_ENABLED: "false"
       LANGFUSE_USE_AZURE_BLOB: "false"
       LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
@@ -297,7 +314,8 @@ services:
       LANGFUSE_INIT_PROJECT_NAME: "Agentic RAG"
       LANGFUSE_INIT_USER_EMAIL: "admin@example.com"
       LANGFUSE_INIT_USER_NAME: "Admin User"
-      LANGFUSE_INIT_USER_PASSWORD: "admin123"
+      # Override in .env; never keep the default on a reachable host
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-admin123}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:3000/api/public/health || exit 1"]
       interval: 30s
@@ -313,13 +331,13 @@ services:
     restart: unless-stopped
     environment:
       - POSTGRES_USER=langfuse
-      - POSTGRES_PASSWORD=langfuse
+      - POSTGRES_PASSWORD=${LANGFUSE_POSTGRES_PASSWORD:-langfuse}
       - POSTGRES_DB=langfuse
       - POSTGRES_HOST_AUTH_METHOD=password
       - TZ=UTC
       - PGTZ=UTC
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - langfuse_v3_postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -335,11 +353,11 @@ services:
     image: docker.io/redis:7
     container_name: rag-langfuse-redis
     restart: unless-stopped
-    command: --requirepass langfuse_redis_password
+    command: --requirepass ${LANGFUSE_REDIS_PASSWORD:-langfuse_redis_password}
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "langfuse_redis_password", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${LANGFUSE_REDIS_PASSWORD:-langfuse_redis_password}", "--no-auth-warning", "ping"]
       interval: 3s
       timeout: 10s
       retries: 10
@@ -353,11 +371,11 @@ services:
     entrypoint: sh
     command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
     environment:
-      - MINIO_ROOT_USER=langfuse_minio
-      - MINIO_ROOT_PASSWORD=langfuse_minio_secret
+      - MINIO_ROOT_USER=${LANGFUSE_MINIO_ACCESS_KEY:-langfuse_minio}
+      - MINIO_ROOT_PASSWORD=${LANGFUSE_MINIO_SECRET_KEY:-langfuse_minio_secret}
     ports:
-      - "9090:9000"
-      - "9091:9001"
+      - "127.0.0.1:9090:9000"
+      - "127.0.0.1:9091:9001"
     volumes:
       - langfuse_v3_minio_data:/data
     healthcheck:

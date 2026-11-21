@@ -11,6 +11,12 @@ class AskRequest(BaseModel):
     use_hybrid: bool = Field(True, description="Use hybrid search (BM25 + vector)")
     model: str = Field("llama3.2:1b", description="Ollama model to use for generation")
     categories: Optional[List[str]] = Field(None, description="Filter by arXiv categories")
+    session_id: Optional[str] = Field(
+        None,
+        description="Conversation id for multi-turn chat (agentic endpoint): follow-ups are resolved against history",
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
 
     class Config:
         json_schema_extra = {
@@ -50,6 +56,9 @@ class AgenticAskResponse(AskResponse):
 
     reasoning_steps: List[str] = Field(..., description="Agent's decision-making steps")
     retrieval_attempts: int = Field(..., description="Number of document retrieval attempts")
+    rewritten_query: Optional[str] = Field(None, description="Query used for the final retrieval, if it was rewritten")
+    standalone_query: Optional[str] = Field(None, description="Follow-up rewritten into a standalone question using history")
+    session_id: Optional[str] = Field(None, description="Conversation id echoed back")
     trace_id: Optional[str] = Field(None, description="Langfuse trace ID for feedback and debugging")
 
     class Config:

@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter
 from sqlalchemy import text
 
@@ -49,9 +51,9 @@ async def health_check(settings: SettingsDep, database: DatabaseDep, opensearch_
             message=f"Index '{stats.get('index_name', 'unknown')}' with {stats.get('document_count', 0)} documents",
         )
 
-    # Run synchronous checks
-    _check_service("database", _check_database)
-    _check_service("opensearch", _check_opensearch)
+    # Run synchronous checks in a worker thread (they block on network I/O)
+    await asyncio.to_thread(_check_service, "database", _check_database)
+    await asyncio.to_thread(_check_service, "opensearch", _check_opensearch)
 
     # Handle Ollama async check separately
     try:

@@ -2,18 +2,19 @@ import logging
 import time
 from typing import Dict, List, Optional
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langfuse.langchain import CallbackHandler
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
-
 from src.services.embeddings.jina_client import JinaEmbeddingsClient
 from src.services.langfuse.client import LangfuseTracer
+from src.services.memory import Turn, format_history
 from src.services.ollama.client import OllamaClient
 from src.services.opensearch.client import OpenSearchClient
 
 from .config import GraphConfig
 from .context import Context
+from .models import ContextualizedQuestion
 from .nodes import (
     ainvoke_generate_answer_step,
     ainvoke_grade_documents_step,
@@ -23,6 +24,7 @@ from .nodes import (
     ainvoke_rewrite_query_step,
     continue_after_guardrail,
 )
+from .prompts import CONTEXTUALIZE_PROMPT
 from .state import AgentState
 from .tools import create_retriever_tool
 
@@ -46,6 +48,8 @@ class AgenticRAGService:
         embeddings_client: JinaEmbeddingsClient,
         langfuse_tracer: Optional[LangfuseTracer] = None,
         graph_config: Optional[GraphConfig] = None,
+        reranker=None,
+        rerank_candidates: int = 20,
     ):
         """Initialize agentic RAG service.
 
@@ -54,12 +58,16 @@ class AgenticRAGService:
         :param embeddings_client: Client for embeddings
         :param langfuse_tracer: Optional Langfuse tracer
         :param graph_config: Configuration for graph execution
+        :param reranker: Optional cross-encoder reranker applied inside the retrieval tool
+        :param rerank_candidates: Chunks fetched before reranking
         """
         self.opensearch = opensearch_client
         self.ollama = ollama_client
         self.embeddings = embeddings_client
         self.langfuse_tracer = langfuse_tracer
         self.graph_config = graph_config or GraphConfig()
+        self.reranker = reranker
+        self.rerank_candidates = rerank_candidates
 
         logger.info("Initializing AgenticRAGService with configuration:")
         logger.info(f"  Model: {self.graph_config.model}")
@@ -91,6 +99,8 @@ class AgenticRAGService:
             embeddings_client=self.embeddings,
             top_k=self.graph_config.top_k,
             use_hybrid=self.graph_config.use_hybrid,
+            reranker=self.reranker,
+            rerank_candidates=self.rerank_candidates,
         )
         tools = [retriever_tool]
 
@@ -164,16 +174,31 @@ class AgenticRAGService:
         query: str,
         user_id: str = "api_user",
         model: Optional[str] = None,
+        top_k: Optional[int] = None,
+        use_hybrid: Optional[bool] = None,
+        categories: Optional[List[str]] = None,
+        history: Optional[List[Turn]] = None,
     ) -> dict:
         """Ask a question using agentic RAG.
 
         :param query: User question
         :param user_id: User identifier for tracing
         :param model: Optional model override
+        :param top_k: Optional override for the number of retrieved chunks
+        :param use_hybrid: Optional override for hybrid (BM25 + vector) retrieval
+        :param categories: Optional arXiv category filter
+        :param history: Previous turns of this conversation; follow-ups are rewritten into a
+            standalone question before the graph runs
         :returns: Dictionary with answer, sources, reasoning steps, and metadata
         :raises ValueError: If query is empty
         """
         model_to_use = model or self.graph_config.model
+        retrieval = {
+            "top_k": top_k or self.graph_config.top_k,
+            "use_hybrid": self.graph_config.use_hybrid if use_hybrid is None else use_hybrid,
+            "categories": categories,
+            "history": history or [],
+        }
 
         logger.info("=" * 80)
         logger.info("Starting Agentic RAG Request")
@@ -194,8 +219,8 @@ class AgenticRAGService:
             metadata = {
                 "env": self.graph_config.settings.environment,
                 "service": "agentic_rag",
-                "top_k": self.graph_config.top_k,
-                "use_hybrid": self.graph_config.use_hybrid,
+                "top_k": retrieval["top_k"],
+                "use_hybrid": retrieval["use_hybrid"],
                 "model": model_to_use,
             }
             # V3 SDK: Use start_as_current_span - will be used with 'with' statement
@@ -215,9 +240,9 @@ class AgenticRAGService:
                         session_id=f"session_{user_id}",
                     )
                     logger.debug(f"Trace created: {trace_obj}")
-                    return await self._run_workflow(query, model_to_use, user_id, trace_obj)
+                    return await self._run_workflow(query, model_to_use, user_id, trace_obj, retrieval)
             else:
-                return await self._run_workflow(query, model_to_use, user_id, None)
+                return await self._run_workflow(query, model_to_use, user_id, None, retrieval)
 
         try:
             return await _execute_with_trace()
@@ -226,16 +251,27 @@ class AgenticRAGService:
             logger.exception("Full traceback:")
             raise
 
-    async def _run_workflow(self, query: str, model_to_use: str, user_id: str, trace) -> dict:
+    async def _run_workflow(
+        self, query: str, model_to_use: str, user_id: str, trace, retrieval: Optional[dict] = None
+    ) -> dict:
         """Execute the workflow with the given trace context."""
+        retrieval = retrieval or {
+            "top_k": self.graph_config.top_k,
+            "use_hybrid": self.graph_config.use_hybrid,
+            "categories": None,
+        }
         try:
             start_time = time.time()
+
+            # Multi-turn: resolve references ("its limitations?") against previous turns so that
+            # guardrail, retrieval and answer all work on a self-contained question.
+            standalone_query = await self._contextualize(query, retrieval.get("history") or [], model_to_use)
 
             logger.info("Invoking LangGraph workflow")
 
             # State initialization
             state_input = {
-                "messages": [HumanMessage(content=query)],
+                "messages": [HumanMessage(content=standalone_query)],
                 "retrieval_attempts": 0,
                 "guardrail_result": None,
                 "routing_decision": None,
@@ -243,6 +279,7 @@ class AgenticRAGService:
                 "relevant_sources": [],
                 "relevant_tool_artefacts": None,
                 "grading_results": [],
+                "relevant_context": None,
                 "metadata": {},
                 "original_query": None,
                 "rewritten_query": None,
@@ -258,7 +295,9 @@ class AgenticRAGService:
                 langfuse_enabled=self.langfuse_tracer is not None and self.langfuse_tracer.client is not None,
                 model_name=model_to_use,
                 temperature=self.graph_config.temperature,
-                top_k=self.graph_config.top_k,
+                top_k=retrieval["top_k"],
+                use_hybrid=retrieval["use_hybrid"],
+                categories=retrieval["categories"],
                 max_retrieval_attempts=self.graph_config.max_retrieval_attempts,
                 guardrail_threshold=self.graph_config.guardrail_threshold,
             )
@@ -294,7 +333,11 @@ class AgenticRAGService:
             retrieval_attempts = result.get("retrieval_attempts", 0)
             reasoning_steps = self._extract_reasoning_steps(result)
 
-            # Update trace (cleanup handled by context manager)
+            chunks_used = self._count_retrieved_chunks(result)
+            trace_id = getattr(trace, "trace_id", None) if trace else None
+
+            # Update trace. The span is ended by the surrounding `with` block; calling
+            # trace.end() here as before ended it twice.
             if trace:
                 trace.update(
                     output={
@@ -305,7 +348,6 @@ class AgenticRAGService:
                         "execution_time": execution_time,
                     }
                 )
-                trace.end()
                 self.langfuse_tracer.flush()
 
             logger.info("=" * 80)
@@ -323,6 +365,10 @@ class AgenticRAGService:
                 "reasoning_steps": reasoning_steps,
                 "retrieval_attempts": retrieval_attempts,
                 "rewritten_query": result.get("rewritten_query"),
+                "standalone_query": standalone_query if standalone_query != query else None,
+                "chunks_used": chunks_used,
+                # Needed by POST /feedback; it was declared in the API schema but never returned.
+                "trace_id": trace_id,
                 "execution_time": execution_time,
                 "guardrail_score": result.get("guardrail_result").score if result.get("guardrail_result") else None,
             }
@@ -334,10 +380,26 @@ class AgenticRAGService:
             # Update trace with error (cleanup handled by context manager)
             if trace:
                 trace.update(output={"error": str(e)}, level="ERROR")
-                trace.end()
                 self.langfuse_tracer.flush()
 
             raise
+
+    async def _contextualize(self, query: str, history: List[Turn], model: str) -> str:
+        """Rewrite a follow-up into a standalone question; returns the query unchanged on failure."""
+        if not history:
+            return query
+        try:
+            llm = self.ollama.get_langchain_model(model=model, temperature=0.0)
+            structured = llm.with_structured_output(ContextualizedQuestion)
+            prompt = CONTEXTUALIZE_PROMPT.format(history=format_history(history), question=query)
+            response = await structured.ainvoke(prompt)
+            standalone = (response.question or "").strip()
+            if standalone:
+                logger.info(f"Contextualized follow-up: '{query[:60]}' -> '{standalone[:60]}'")
+                return standalone
+        except Exception as e:
+            logger.warning(f"Failed to contextualize follow-up question, using it as is: {e}")
+        return query
 
     def _extract_answer(self, result: dict) -> str:
         """Extract final answer from graph result."""
@@ -348,18 +410,32 @@ class AgenticRAGService:
         final_message = messages[-1]
         return final_message.content if hasattr(final_message, "content") else str(final_message)
 
-    def _extract_sources(self, result: dict) -> List[dict]:
-        """Extract sources from graph result."""
-        sources = []
-        relevant_sources = result.get("relevant_sources", [])
+    def _extract_sources(self, result: dict) -> List[str]:
+        """Extract source PDF URLs from graph result.
 
-        for source in relevant_sources:
-            if hasattr(source, "to_dict"):
-                sources.append(source.to_dict())
+        Returns plain URLs to match ``AgenticAskResponse.sources: List[str]`` (returning dicts,
+        as before, would fail response validation as soon as any source was present).
+        """
+        urls: List[str] = []
+        for source in result.get("relevant_sources", []) or []:
+            if hasattr(source, "url"):
+                url = source.url
             elif isinstance(source, dict):
-                sources.append(source)
+                url = source.get("url", "")
+            else:
+                url = str(source)
+            if url and url not in urls:
+                urls.append(url)
+        return urls
 
-        return sources
+    @staticmethod
+    def _count_retrieved_chunks(result: dict) -> int:
+        """Number of chunks returned by the latest retrieval call."""
+        for msg in reversed(result.get("messages", [])):
+            if isinstance(msg, ToolMessage):
+                artifact = getattr(msg, "artifact", None)
+                return len(artifact) if artifact else 0
+        return 0
 
     def _extract_reasoning_steps(self, result: dict) -> List[str]:
         """Extract reasoning steps from graph result."""
@@ -376,12 +452,20 @@ class AgenticRAGService:
 
         if grading_results:
             relevant_count = sum(1 for g in grading_results if g.is_relevant)
-            steps.append(f"Graded documents ({relevant_count} relevant)")
+            steps.append(f"Graded documents ({relevant_count}/{len(grading_results)} relevant)")
 
         if result.get("rewritten_query"):
             steps.append("Rewritten query for better results")
 
-        steps.append("Generated answer from context")
+        # Report what actually happened instead of always claiming an answer was generated
+        if guardrail_result and guardrail_result.score < self.graph_config.guardrail_threshold:
+            steps.append("Rejected as out of scope")
+        elif grading_results and any(g.is_relevant for g in grading_results):
+            steps.append("Generated answer from context")
+        elif retrieval_attempts > 0:
+            steps.append("No relevant documents found - returned fallback message")
+        else:
+            steps.append("Generated answer from context")
 
         return steps
 

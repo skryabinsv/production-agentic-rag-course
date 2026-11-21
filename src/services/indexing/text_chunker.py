@@ -15,16 +15,26 @@ class TextChunker:
     Default: 600 words per chunk with 100 word overlap.
     """
 
-    def __init__(self, chunk_size: int = 600, overlap_size: int = 100, min_chunk_size: int = 100):
+    def __init__(
+        self,
+        chunk_size: int = 600,
+        overlap_size: int = 100,
+        min_chunk_size: int = 100,
+        include_abstract_in_chunks: bool = False,
+    ):
         """Initialize text chunker.
 
         :param chunk_size: Target number of words per chunk
         :param overlap_size: Number of overlapping words between chunks
         :param min_chunk_size: Minimum words for a chunk to be valid
+        :param include_abstract_in_chunks: Legacy mode - prefix every section chunk with title +
+            full abstract. Default (False): title-only header and one dedicated abstract chunk,
+            so section embeddings reflect the section rather than the shared abstract.
         """
         self.chunk_size = chunk_size
         self.overlap_size = overlap_size
         self.min_chunk_size = min_chunk_size
+        self.include_abstract_in_chunks = include_abstract_in_chunks
 
         if overlap_size >= chunk_size:
             raise ValueError("Overlap size must be less than chunk size")
@@ -111,7 +121,7 @@ class TextChunker:
             if words:
                 return [
                     TextChunk(
-                        text=self._reconstruct_text(words, text),
+                        text=self._reconstruct_text(words),
                         metadata=ChunkMetadata(
                             chunk_index=0,
                             start_char=0,
@@ -199,12 +209,20 @@ class TextChunker:
             logger.warning(f"No meaningful sections found after filtering for {arxiv_id}")
             return []
 
-        # Create header (title + abstract)
-        header = f"{title}\n\nAbstract: {abstract}\n\n"
-
         # Process sections using hybrid strategy
         chunks = []
         small_sections = []  # Buffer for combining small sections
+
+        if self.include_abstract_in_chunks:
+            # Legacy: header (title + abstract) repeated in every chunk
+            header = f"{title}\n\nAbstract: {abstract}\n\n"
+        else:
+            # Title gives each chunk its paper context; the abstract is indexed once, on its own
+            header = f"{title}\n\n"
+            if abstract and abstract.strip():
+                chunks.append(
+                    self._create_section_chunk(f"{header}Abstract: {abstract.strip()}", "Abstract", 0, arxiv_id, paper_id)
+                )
 
         section_items = list(sections_dict.items())
 
@@ -344,6 +362,11 @@ class TextChunker:
         content_lower = content.lower().strip()
         abstract_lower = abstract.lower().strip()
 
+        # An empty abstract is a substring of everything: without this guard every
+        # section would be classified as a duplicate and silently dropped.
+        if not abstract_lower:
+            return False
+
         # Direct string match (allowing for minor formatting differences)
         if abstract_lower in content_lower or content_lower in abstract_lower:
             return True
@@ -402,13 +425,18 @@ class TextChunker:
             combined_content.append(f"Section: {section_title}\n\n{content}")
             total_words += word_count
 
-        combined_text = f"{header}{'\\n\\n'.join(combined_content)}"
+        section_separator = "\n\n"
+        combined_text = f"{header}{section_separator.join(combined_content)}"
 
-        # If still too small, combine with previous chunk if possible
-        if total_words + len(header.split()) < 200 and existing_chunks:
+        # If still too small, combine with previous chunk if possible (never into the abstract chunk)
+        if (
+            total_words + len(header.split()) < 200
+            and existing_chunks
+            and existing_chunks[-1].metadata.section_title != "Abstract"
+        ):
             # Try to merge with previous chunk
             prev_chunk = existing_chunks[-1]
-            merged_text = f"{prev_chunk.text}\\n\\n{'\\n\\n'.join(combined_content)}"
+            merged_text = f"{prev_chunk.text}{section_separator}{section_separator.join(combined_content)}"
 
             # Update the previous chunk
             existing_chunks[-1] = TextChunk(

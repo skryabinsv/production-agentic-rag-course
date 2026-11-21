@@ -7,8 +7,14 @@ from src.config import Settings
 from src.exceptions import OllamaConnectionError, OllamaException, OllamaTimeoutError
 from src.schemas.ollama import RAGResponse
 from src.services.ollama.prompts import RAGPromptBuilder, ResponseParser
+from src.utils.arxiv import arxiv_pdf_url
 
 logger = logging.getLogger(__name__)
+
+# Fields that Ollama's /api/generate accepts at the top level of the request body.
+# Everything else (temperature, top_p, num_ctx, seed, ...) must go into "options",
+# otherwise Ollama silently ignores it.
+_OLLAMA_TOP_LEVEL_FIELDS = {"format", "system", "template", "raw", "keep_alive", "images", "suffix", "context", "think"}
 
 
 class OllamaClient:
@@ -17,9 +23,47 @@ class OllamaClient:
     def __init__(self, settings: Settings):
         """Initialize Ollama client with settings."""
         self.base_url = settings.ollama_host
-        self.timeout = httpx.Timeout(float(settings.ollama_timeout))
+        self.timeout_seconds = float(settings.ollama_timeout)
+        self.timeout = httpx.Timeout(self.timeout_seconds)
+        self.num_ctx = settings.ollama_num_ctx
+        self.temperature = settings.ollama_temperature
         self.prompt_builder = RAGPromptBuilder()
         self.response_parser = ResponseParser()
+
+    def _build_payload(self, model: str, prompt: str, stream: bool, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Build an /api/generate payload, routing sampling params into ``options``.
+
+        Also pins ``num_ctx``: Ollama's default context window is small and longer
+        RAG prompts (several 600-800 word chunks) would otherwise be truncated silently.
+        """
+        params = dict(params)
+        options: Dict[str, Any] = dict(params.pop("options", None) or {})
+        top_level: Dict[str, Any] = {}
+        for key, value in params.items():
+            if key in _OLLAMA_TOP_LEVEL_FIELDS:
+                top_level[key] = value
+            else:
+                options[key] = value
+        options.setdefault("num_ctx", self.num_ctx)
+        return {"model": model, "prompt": prompt, "stream": stream, **top_level, "options": options}
+
+    def get_langchain_model(self, model: str, temperature: Optional[float] = None, **kwargs: Any):
+        """Return a LangChain chat model bound to this Ollama instance.
+
+        Used by the LangGraph agent nodes (guardrail, grading, rewriting, generation).
+        This method was referenced by every agent node but never implemented, so the
+        agentic pipeline always fell back to its error paths.
+        """
+        from langchain_ollama import ChatOllama
+
+        return ChatOllama(
+            model=model,
+            base_url=self.base_url,
+            temperature=self.temperature if temperature is None else temperature,
+            num_ctx=self.num_ctx,
+            client_kwargs={"timeout": self.timeout_seconds},
+            **kwargs,
+        )
 
     async def health_check(self) -> Dict[str, Any]:
         """
@@ -97,9 +141,9 @@ class OllamaClient:
         """
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                data = {"model": model, "prompt": prompt, "stream": stream, **kwargs}
+                data = self._build_payload(model, prompt, stream, kwargs)
 
-                logger.info(f"Sending request to Ollama: model={model}, stream={stream}, extra_params={kwargs}")
+                logger.info(f"Sending request to Ollama: model={model}, stream={stream}, options={data['options']}")
                 response = await client.post(f"{self.base_url}/api/generate", json=data)
 
                 if response.status_code == 200:
@@ -164,7 +208,7 @@ class OllamaClient:
         """
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                data = {"model": model, "prompt": prompt, "stream": True, **kwargs}
+                data = self._build_payload(model, prompt, True, kwargs)
 
                 logger.info(f"Starting streaming generation: model={model}")
 
@@ -218,7 +262,7 @@ class OllamaClient:
                 response = await self.generate(
                     model=model,
                     prompt=prompt_data["prompt"],
-                    temperature=0.7,
+                    temperature=self.temperature,
                     top_p=0.9,
                     format=prompt_data["format"],
                 )
@@ -230,7 +274,7 @@ class OllamaClient:
                 response = await self.generate(
                     model=model,
                     prompt=prompt,
-                    temperature=0.7,
+                    temperature=self.temperature,
                     top_p=0.9,
                 )
 
@@ -250,8 +294,7 @@ class OllamaClient:
                     for chunk in chunks:
                         arxiv_id = chunk.get("arxiv_id")
                         if arxiv_id:
-                            arxiv_id_clean = arxiv_id.split("v")[0] if "v" in arxiv_id else arxiv_id
-                            pdf_url = f"https://arxiv.org/pdf/{arxiv_id_clean}.pdf"
+                            pdf_url = arxiv_pdf_url(arxiv_id)
                             if pdf_url not in seen_urls:
                                 sources.append(pdf_url)
                                 seen_urls.add(pdf_url)
@@ -296,7 +339,7 @@ class OllamaClient:
             async for chunk in self.generate_stream(
                 model=model,
                 prompt=prompt,
-                temperature=0.7,
+                temperature=self.temperature,
                 top_p=0.9,
             ):
                 yield chunk

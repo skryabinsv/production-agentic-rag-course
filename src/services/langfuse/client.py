@@ -176,7 +176,8 @@ class LangfuseTracer:
             return False
 
         try:
-            self.client.score(
+            # Langfuse v3 API (v2's `client.score()` no longer exists, so feedback always failed)
+            self.client.create_score(
                 trace_id=trace_id,
                 name=name,
                 value=score,
@@ -243,16 +244,16 @@ class LangfuseTracer:
             return
 
         try:
-            generation = self.client.generation(
+            generation = self.client.start_generation(
                 name=name,
                 model=model,
                 input=input_data,
                 metadata=metadata or {},
             )
-            yield generation
         except Exception as e:
             logger.error(f"Error creating generation span: {e}")
-            yield None
+            generation = None
+        yield generation
 
     @contextmanager
     def start_span(
@@ -289,15 +290,22 @@ class LangfuseTracer:
             return
 
         try:
-            span = self.client.span(
+            span = self.client.start_span(
                 name=name,
                 input=input_data,
                 metadata=metadata or {},
             )
-            yield span
         except Exception as e:
             logger.error(f"Error creating span: {e}")
-            yield None
+            span = None
+        try:
+            yield span
+        finally:
+            if span is not None:
+                try:
+                    span.end()
+                except Exception as e:
+                    logger.warning(f"Error ending span: {e}")
 
     def update_generation(
         self,
@@ -328,7 +336,7 @@ class LangfuseTracer:
             if usage_metadata:
                 # Add usage metadata following Langfuse format
                 if "prompt_tokens" in usage_metadata:
-                    update_data["usage"] = {
+                    update_data["usage_details"] = {
                         "input": usage_metadata.get("prompt_tokens", 0),
                         "output": usage_metadata.get("completion_tokens", 0),
                         "total": usage_metadata.get("total_tokens", 0),
@@ -353,7 +361,10 @@ class LangfuseTracer:
         status_message: Optional[str] = None,
     ):
         """
-        Update a span with output and metadata.
+        Update a span with output and metadata (does not end it - see ``end_span``).
+
+        Callers (RAGTracer, agent nodes) end spans themselves; ending here as well made
+        every span end twice.
 
         Args:
             span: Span object from start_span()
@@ -378,6 +389,70 @@ class LangfuseTracer:
 
             if update_data:
                 span.update(**update_data)
-            span.end()
         except Exception as e:
             logger.error(f"Error updating span: {e}")
+
+    # ------------------------------------------------------------------------------------
+    # Helpers used by RAGTracer (/ask, /stream) and the agent nodes. They were called
+    # everywhere but went missing in the Langfuse v3 rewrite, which made /api/v1/ask and
+    # /api/v1/stream fail with AttributeError on every request.
+    # ------------------------------------------------------------------------------------
+
+    @contextmanager
+    def trace_rag_request(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Top-level trace for one RAG request. Yields the root span, or None if disabled.
+
+        Uses a non-"current" span on purpose: /stream runs inside an async generator, where
+        OpenTelemetry context attach/detach across yields is unreliable.
+        Tracing failures never break the request.
+        """
+        span = None
+        if self.client:
+            try:
+                span = self.client.start_span(name="rag_request", input={"query": query}, metadata=metadata or {})
+                span.update_trace(name="rag_request", user_id=user_id, session_id=session_id, input={"query": query})
+            except Exception as e:
+                logger.warning(f"Failed to start Langfuse trace: {e}")
+                span = None
+        try:
+            yield span
+        finally:
+            if span is not None:
+                try:
+                    span.end()
+                except Exception as e:
+                    logger.warning(f"Failed to end Langfuse trace: {e}")
+
+    def create_span(
+        self,
+        trace=None,
+        name: str = "span",
+        input_data: Optional[Any] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Create a child span under ``trace`` (or a root span). Returns None if disabled/failing."""
+        if not self.client:
+            return None
+        try:
+            parent = trace if trace is not None else self.client
+            return parent.start_span(name=name, input=input_data, metadata=metadata or {})
+        except Exception as e:
+            logger.warning(f"Failed to create span '{name}': {e}")
+            return None
+
+    def end_span(self, span, output: Optional[Any] = None, metadata: Optional[Dict[str, Any]] = None):
+        """Optionally update and then end a span."""
+        if not span:
+            return
+        try:
+            if output is not None or metadata:
+                self.update_span(span, output=output, metadata=metadata)
+            span.end()
+        except Exception as e:
+            logger.error(f"Error ending span: {e}")

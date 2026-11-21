@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from typing import Dict
@@ -8,7 +9,8 @@ from ..context import Context
 from ..models import GradeDocuments, GradingResult
 from ..prompts import GRADE_DOCUMENTS_PROMPT
 from ..state import AgentState
-from .utils import get_latest_context, get_latest_query
+from ..tools import format_documents_for_llm
+from .utils import documents_to_sources, get_latest_context, get_latest_tool_documents, get_original_query
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +32,8 @@ async def ainvoke_grade_documents_step(
     logger.info("NODE: grade_documents")
     start_time = time.time()
 
-    # Get query and context
-    question = get_latest_query(state["messages"])
+    # Grade against what the user asked, not against a retrieval-oriented rewrite
+    question = get_original_query(state)
     context = get_latest_context(state["messages"])
 
     # Extract document chunks from context for logging
@@ -76,59 +78,44 @@ async def ainvoke_grade_documents_step(
                 metadata={"execution_time_ms": execution_time},
             )
 
-        return {"routing_decision": "rewrite_query", "grading_results": []}
+        return {"routing_decision": "rewrite_query", "grading_results": [], "relevant_sources": []}
 
     logger.debug(f"Grading context of length {len(context)} characters")
 
-    # Use LLM to grade document relevance
+    llm = None
     try:
-        # Create grading prompt from template
-        grading_prompt = GRADE_DOCUMENTS_PROMPT.format(
-            context=context,
-            question=question,
-        )
-
-        # Get LLM from runtime context
-        llm = runtime.context.ollama_client.get_langchain_model(
-            model=runtime.context.model_name,
-            temperature=0.0,
-        )
-
-        # Create structured output LLM for grading
-        structured_llm = llm.with_structured_output(GradeDocuments)
-
-        # Invoke LLM grading
-        logger.info("Invoking LLM for document grading")
-        grading_response = await structured_llm.ainvoke(grading_prompt)
-
-        is_relevant = grading_response.binary_score == "yes"
-        score = 1.0 if is_relevant else 0.0
-
-        logger.info(f"LLM grading: score={grading_response.binary_score}, reasoning={grading_response.reasoning}")
-
-        # Create grading result record
-        grading_result = GradingResult(
-            document_id="retrieved_docs",
-            is_relevant=is_relevant,
-            score=score,
-            reasoning=grading_response.reasoning,
-        )
-
+        llm = runtime.context.ollama_client.get_langchain_model(model=runtime.context.model_name, temperature=0.0)
     except Exception as e:
-        logger.error(f"LLM grading failed: {e}, falling back to heuristic")
-        # Fallback to simple heuristic if LLM fails
-        is_relevant = len(context.strip()) > 50
-        grading_result = GradingResult(
-            document_id="retrieved_docs",
-            is_relevant=is_relevant,
-            score=1.0 if is_relevant else 0.0,
-            reasoning=f"Fallback heuristic (LLM failed): {'sufficient content' if is_relevant else 'insufficient content'}",
+        logger.error(f"Could not create grading LLM: {e}")
+
+    documents = get_latest_tool_documents(state["messages"])
+
+    if documents:
+        # Grade every document separately (concurrently) and keep only relevant ones. The
+        # original implementation produced a single yes/no for the whole concatenated context,
+        # so irrelevant chunks still reached the answer prompt and the source list.
+        grading_results = list(
+            await asyncio.gather(*(_grade_one(llm, question, doc, i) for i, doc in enumerate(documents)))
         )
+        relevant_docs = [doc for doc, grade in zip(documents, grading_results) if grade.is_relevant]
+        is_relevant = bool(relevant_docs)
+        relevant_context = format_documents_for_llm(relevant_docs)
+        relevant_sources = documents_to_sources(relevant_docs)
+    else:
+        # No structured artefact (e.g. legacy tool output): grade the whole context at once
+        grading_results = [await _grade_text(llm, question, context, "retrieved_docs")]
+        is_relevant = grading_results[0].is_relevant
+        relevant_context = context if is_relevant else ""
+        relevant_sources = []
+
+    score = sum(g.score for g in grading_results) / len(grading_results) if grading_results else 0.0
 
     # Determine routing
     route = "generate_answer" if is_relevant else "rewrite_query"
 
-    logger.info(f"Grading result: {'relevant' if is_relevant else 'not relevant'}, routing to: {route}")
+    logger.info(
+        f"Grading result: {sum(g.is_relevant for g in grading_results)}/{len(grading_results)} relevant, routing to: {route}"
+    )
 
     # Update span with grading result
     if span:
@@ -139,7 +126,7 @@ async def ainvoke_grade_documents_step(
                 "routing_decision": route,
                 "is_relevant": is_relevant,
                 "score": score,
-                "reasoning": grading_result.reasoning,
+                "per_document": [g.model_dump() for g in grading_results],
             },
             metadata={
                 "execution_time_ms": execution_time,
@@ -149,5 +136,38 @@ async def ainvoke_grade_documents_step(
 
     return {
         "routing_decision": route,
-        "grading_results": [grading_result],
+        "grading_results": grading_results,
+        # Only documents graded relevant are used for the answer and listed as sources
+        "relevant_sources": relevant_sources,
+        "relevant_context": relevant_context,
     }
+
+
+async def _grade_text(llm, question: str, text: str, document_id: str) -> GradingResult:
+    """Binary relevance grade for one piece of text, with a conservative fallback."""
+    try:
+        if llm is None:
+            raise RuntimeError("grading LLM unavailable")
+        structured_llm = llm.with_structured_output(GradeDocuments)
+        response = await structured_llm.ainvoke(GRADE_DOCUMENTS_PROMPT.format(context=text, question=question))
+        is_relevant = response.binary_score == "yes"
+        logger.info(f"LLM grading [{document_id}]: {response.binary_score} - {response.reasoning}")
+        return GradingResult(
+            document_id=document_id, is_relevant=is_relevant, score=1.0 if is_relevant else 0.0, reasoning=response.reasoning
+        )
+    except Exception as e:
+        logger.error(f"LLM grading failed for {document_id}: {e}, falling back to heuristic")
+        # Keep non-trivial documents rather than discarding everything when the grader fails
+        is_relevant = len((text or "").strip()) > 50
+        return GradingResult(
+            document_id=document_id,
+            is_relevant=is_relevant,
+            score=1.0 if is_relevant else 0.0,
+            reasoning=f"Fallback heuristic (LLM failed): {'sufficient content' if is_relevant else 'insufficient content'}",
+        )
+
+
+async def _grade_one(llm, question: str, document, index: int) -> GradingResult:
+    meta = getattr(document, "metadata", {}) or {}
+    document_id = f"{meta.get('arxiv_id', 'doc')}#{index}"
+    return await _grade_text(llm, question, format_documents_for_llm([document]), document_id)

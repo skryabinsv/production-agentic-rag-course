@@ -106,3 +106,9 @@ class ReasoningStep(BaseModel):
     step_name: str = Field(description="Name of the reasoning step")
     description: str = Field(description="Human-readable description")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Step metadata")
+
+
+class ContextualizedQuestion(BaseModel):
+    """Standalone version of a follow-up question."""
+
+    question: str = Field(description="Standalone question")

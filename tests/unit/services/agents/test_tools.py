@@ -1,8 +1,18 @@
-import pytest
 from unittest.mock import AsyncMock
-from langchain_core.documents import Document
 
+import pytest
+from langchain_core.documents import Document
 from src.services.agents.tools import create_retriever_tool
+
+
+async def _invoke_documents(tool, args):
+    """Invoke the tool the way ToolNode does and return its document artefact.
+
+    The tool uses response_format="content_and_artifact": the LLM-facing content is a formatted
+    string, the Documents travel as the ToolMessage artefact.
+    """
+    message = await tool.ainvoke({"type": "tool_call", "id": "call_1", "name": tool.name, "args": args})
+    return message.artifact, message.content
 
 
 @pytest.mark.asyncio
@@ -20,7 +30,7 @@ async def test_create_retriever_tool_basic(mock_opensearch_client, mock_jina_emb
     assert "Search and return relevant arXiv research papers" in tool.description
 
     # Invoke tool
-    result = await tool.ainvoke({"query": "machine learning"})
+    result, content = await _invoke_documents(tool, {"query": "machine learning"})
 
     # Verify result
     assert isinstance(result, list)
@@ -33,6 +43,13 @@ async def test_create_retriever_tool_basic(mock_opensearch_client, mock_jina_emb
     assert first_doc.metadata["arxiv_id"] == "1706.03762"
     assert first_doc.metadata["title"] == "Attention Is All You Need"
     assert first_doc.metadata["score"] == 0.95
+
+    # The LLM sees a clean, delimited context instead of a Python repr of Documents
+    assert content.startswith("<document>")
+    assert "arXiv:1706.03762" in content
+    assert "metadata=" not in content
+    # Sources are version-less canonical URLs
+    assert result[1].metadata["source"] == "https://arxiv.org/pdf/1810.04805.pdf"
 
     # Verify embeddings were generated
     mock_jina_embeddings_client.embed_query.assert_called_once_with("machine learning")
@@ -56,7 +73,7 @@ async def test_retriever_tool_empty_results(mock_opensearch_client, mock_jina_em
         embeddings_client=mock_jina_embeddings_client,
     )
 
-    result = await tool.ainvoke({"query": "nonexistent topic"})
+    result, content = await _invoke_documents(tool, {"query": "nonexistent topic"})
 
     assert isinstance(result, list)
     assert len(result) == 0
@@ -72,7 +89,7 @@ async def test_retriever_tool_custom_top_k(mock_opensearch_client, mock_jina_emb
         use_hybrid=False,
     )
 
-    await tool.ainvoke({"query": "test query"})
+    await _invoke_documents(tool, {"query": "test query"})
 
     call_args = mock_opensearch_client.search_unified.call_args
     # search_unified uses 'size' parameter, not 'top_k'
@@ -102,7 +119,7 @@ async def test_retriever_tool_metadata_fields(mock_opensearch_client, mock_jina_
         embeddings_client=mock_jina_embeddings_client,
     )
 
-    result = await tool.ainvoke({"query": "test"})
+    result, content = await _invoke_documents(tool, {"query": "test"})
 
     doc = result[0]
     assert "arxiv_id" in doc.metadata
@@ -111,3 +128,29 @@ async def test_retriever_tool_metadata_fields(mock_opensearch_client, mock_jina_
     assert "score" in doc.metadata
     assert "source" in doc.metadata
     assert "section" in doc.metadata
+
+
+@pytest.mark.asyncio
+async def test_retriever_tool_falls_back_to_bm25_when_embeddings_fail(mock_opensearch_client, mock_jina_embeddings_client):
+    """An embedding-API outage must degrade to BM25 instead of failing the agent run."""
+    mock_jina_embeddings_client.embed_query = AsyncMock(side_effect=RuntimeError("jina down"))
+    tool = create_retriever_tool(opensearch_client=mock_opensearch_client, embeddings_client=mock_jina_embeddings_client)
+
+    documents, _ = await _invoke_documents(tool, {"query": "transformers"})
+
+    assert len(documents) == 2
+    call_kwargs = mock_opensearch_client.search_unified.call_args.kwargs
+    assert call_kwargs["use_hybrid"] is False
+    assert call_kwargs["query_embedding"] is None
+
+
+@pytest.mark.asyncio
+async def test_retriever_tool_per_call_overrides(mock_opensearch_client, mock_jina_embeddings_client):
+    """Per-request top_k / categories passed by the retrieve node reach OpenSearch."""
+    tool = create_retriever_tool(opensearch_client=mock_opensearch_client, embeddings_client=mock_jina_embeddings_client, top_k=3)
+
+    await _invoke_documents(tool, {"query": "q", "top_k": 7, "categories": ["cs.CL"]})
+
+    call_kwargs = mock_opensearch_client.search_unified.call_args.kwargs
+    assert call_kwargs["size"] == 7
+    assert call_kwargs["categories"] == ["cs.CL"]

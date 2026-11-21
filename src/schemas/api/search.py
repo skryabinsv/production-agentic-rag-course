@@ -23,6 +23,7 @@ class HybridSearchRequest(BaseModel):
     latest_papers: bool = Field(False, description="Sort by publication date instead of relevance")
     use_hybrid: bool = Field(True, description="Enable hybrid search (BM25 + vector) with automatic embedding generation")
     min_score: float = Field(0.0, description="Minimum score threshold for results", ge=0.0)
+    rerank: bool = Field(False, description="Rerank results with the configured cross-encoder (RERANKER__ENABLED)")
 
     class Config:
         populate_by_name = True

@@ -1,0 +1,4 @@
+{"query": "self-attention transformer architecture without recurrence", "relevant_arxiv_ids": ["1706.03762"]}
+{"query": "bidirectional pre-training of language representations", "relevant_arxiv_ids": ["1810.04805"]}
+{"query": "retrieval-augmented generation for knowledge-intensive NLP tasks", "relevant_arxiv_ids": ["2005.11401"]}
+{"query": "What is the boiling point of tungsten at sea level?", "relevant_arxiv_ids": [], "answerable": false}

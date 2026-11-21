@@ -92,6 +92,45 @@ def get_latest_query(messages: List) -> str:
     raise ValueError("No user query found in messages")
 
 
+def get_original_query(state: Dict) -> str:
+    """Return the user's original question (before any rewrites).
+
+    Rewritten queries are optimised for retrieval, not for answering: grading and answer
+    generation must target what the user actually asked.
+    """
+    return state.get("original_query") or get_latest_query(state["messages"])
+
+
+def get_latest_tool_documents(messages: List) -> List:
+    """Return the documents (tool artefact) attached to the latest retrieval ToolMessage."""
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            artifact = getattr(msg, "artifact", None)
+            return list(artifact) if artifact else []
+    return []
+
+
+def documents_to_sources(documents: List) -> List[SourceItem]:
+    """Convert retrieved LangChain documents into de-duplicated SourceItem records."""
+    sources: Dict[str, SourceItem] = {}
+    for doc in documents:
+        meta = getattr(doc, "metadata", {}) or {}
+        arxiv_id = meta.get("arxiv_id")
+        if not arxiv_id or arxiv_id in sources:
+            continue
+        authors = meta.get("authors") or []
+        if isinstance(authors, str):
+            authors = [a.strip() for a in authors.split(",") if a.strip()]
+        sources[arxiv_id] = SourceItem(
+            arxiv_id=arxiv_id,
+            title=meta.get("title", ""),
+            authors=authors,
+            url=meta.get("source", ""),
+            relevance_score=float(meta.get("score", 0.0) or 0.0),
+        )
+    return list(sources.values())
+
+
 def get_latest_context(messages: List) -> str:
     """Get the latest context from tool messages.
 

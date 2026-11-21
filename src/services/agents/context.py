@@ -1,7 +1,7 @@
 from dataclasses import dataclass
-from langfuse._client.span import LangfuseSpan
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
+from langfuse._client.span import LangfuseSpan
 from src.services.embeddings.jina_client import JinaEmbeddingsClient
 from src.services.langfuse.client import LangfuseTracer
 from src.services.ollama.client import OllamaClient
@@ -23,6 +23,8 @@ class Context:
     :param model_name: Model to use for LLM calls
     :param temperature: Temperature for generation
     :param top_k: Number of documents to retrieve
+    :param use_hybrid: Use hybrid (BM25 + vector) retrieval
+    :param categories: Optional arXiv category filter for retrieval
     :param max_retrieval_attempts: Maximum retrieval attempts
     :param guardrail_threshold: Threshold for guardrail validation (0-100)
     """
@@ -36,5 +38,7 @@ class Context:
     model_name: str = "llama3.2:1b"
     temperature: float = 0.0
     top_k: int = 3
+    use_hybrid: bool = True
+    categories: Optional[List[str]] = None
     max_retrieval_attempts: int = 2
     guardrail_threshold: int = 60

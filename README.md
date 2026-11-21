@@ -45,6 +45,21 @@ By the end of this course, you'll have your own AI research assistant and the de
 
 ---
 
+> **📝 Fork notes (review & fixes).** This fork contains a critical review of the course and a set of fixes
+> on top of upstream `main`:
+> - **bugs:** broken Week 2 PDF parsing, `/ask`/`/stream` crashing on every request, a non-functional Week 7
+>   agent, Langfuse silently disabled, a category-filter leak in hybrid search, chunking bugs;
+> - **security:** ports on `127.0.0.1`, passwords from `.env`, optional API keys + rate limiting, private Telegram bot,
+>   prompt-injection hardening;
+> - **RAG quality:** cross-encoder reranking, per-document grading, abstract as its own chunk, multi-turn memory
+>   for the agent, optional local (private) embeddings, non-blocking I/O;
+> - **evaluation:** `make eval` (retrieval) and `make eval-answers` (citations, refusals, LLM judge).
+>
+> See **[docs/COURSE_REVIEW_RU.md](docs/COURSE_REVIEW_RU.md)** (in Russian) for the pros/cons/risks analysis,
+> the full change list and migration notes, and **[evals/README.md](evals/README.md)** for measuring quality.
+
+---
+
 ## 🏗️ System Architecture Evolution
 
 ### Week 7: Agentic RAG & Telegram Bot Integration
@@ -134,11 +149,14 @@ docker compose up --build -d
 |---------|-----|---------|
 | **API Documentation** | http://localhost:8000/docs | Interactive API testing |
 | **Gradio RAG Interface** | http://localhost:7861 | User-friendly chat interface |
-| **Langfuse Dashboard** | http://localhost:3000 | RAG pipeline monitoring & tracing |
+| **Langfuse Dashboard** | http://localhost:3001 | RAG pipeline monitoring & tracing |
 | **Airflow Dashboard** | http://localhost:8080 | Workflow management |
 | **OpenSearch Dashboards** | http://localhost:5601 | Hybrid search engine UI |
 
 #### **NOTE**: Check airflow/simple_auth_manager_passwords.json.generated for Airflow username and password
+
+> All ports are published on `127.0.0.1` only (see the note at the top of `compose.yml`): the stack uses
+> default dev credentials, Redis has no password and OpenSearch runs with security disabled.
 ---
 
 ## 📚 Week 1: Infrastructure Foundation ✅
@@ -425,7 +443,14 @@ cp .env.example .env
 **Key Variables:**
 - `JINA_API_KEY` - Required for Week 4+ (hybrid search with embeddings)
 - `TELEGRAM__BOT_TOKEN` - Required for Week 7 (Telegram bot integration)
-- `LANGFUSE__PUBLIC_KEY` & `LANGFUSE__SECRET_KEY` - Optional for Week 6 (monitoring)
+- `TELEGRAM__ALLOWED_USER_IDS` - Comma-separated Telegram user ids allowed to use the bot (recommended)
+- `LANGFUSE_PUBLIC_KEY` & `LANGFUSE_SECRET_KEY` (or `LANGFUSE__*`) - Optional for Week 6 (monitoring)
+- `OLLAMA_NUM_CTX`, `OLLAMA_TEMPERATURE`, `OLLAMA_ALLOWED_MODELS` - LLM context window, sampling and model allow-list
+- `API_KEYS`, `RATE_LIMIT_PER_MINUTE` - API authentication (`X-API-Key` / `Bearer`) and per-client rate limit
+- `RERANKER__ENABLED`, `RERANKER__PROVIDER` - cross-encoder reranking (`local` or `jina`)
+- `EMBEDDINGS__PROVIDER` - `jina` (hosted) or `local` (sentence-transformers, private; requires re-indexing)
+- `CONVERSATION__*` - multi-turn memory for `/api/v1/ask-agentic` (send the same `session_id`)
+- `POSTGRES_PASSWORD`, `REDIS__PASSWORD`, `CLICKHOUSE_PASSWORD`, `LANGFUSE_*_PASSWORD`, `AIRFLOW_ADMIN_PASSWORD` - service credentials
 
 **Complete Configuration:** See [.env.example](.env.example) for all available options and detailed documentation.
 
@@ -468,11 +493,12 @@ arxiv-paper-curator/
 
 | Endpoint | Method | Description | Week |
 |----------|--------|-------------|------|
-| `/health` | GET | Service health check | Week 1 |
-| `/api/v1/papers` | GET | List stored papers | Week 2 |
-| `/api/v1/papers/{id}` | GET | Get specific paper | Week 2 |
-| `/api/v1/search` | POST | BM25 keyword search | Week 3 |
-| `/api/v1/hybrid-search/` | POST | Hybrid search (BM25 + Vector) | **Week 4** |
+| `/api/v1/health` | GET | Service health check | Week 1 |
+| `/api/v1/hybrid-search/` | POST | BM25 (`use_hybrid=false`) or hybrid (BM25 + vector) search | Week 3-4 |
+| `/api/v1/ask` | POST | RAG answer with sources | Week 5-6 |
+| `/api/v1/stream` | POST | Streaming RAG answer (Server-Sent Events) | Week 5-6 |
+| `/api/v1/ask-agentic` | POST | Agentic RAG (guardrail, grading, query rewrite) | Week 7 |
+| `/api/v1/feedback` | POST | User feedback for a `trace_id` (Langfuse) | Week 7 |
 
 **API Documentation:** Visit http://localhost:8000/docs for interactive API explorer
 
@@ -504,6 +530,8 @@ make stop          # Stop services
 | `make lint` | Lint and type check |
 | `make test` | Run tests |
 | `make test-cov` | Run tests with coverage |
+| `make eval GOLDEN=...` | Retrieval quality report (Recall/MRR/nDCG, BM25 vs hybrid) |
+| `make eval-answers GOLDEN=... [JUDGE=model]` | Answer quality report (citations, refusals, optional LLM judge) |
 | `make clean` | Clean up everything |
 
 #### **Direct Commands** (Alternative)

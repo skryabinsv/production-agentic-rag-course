@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -19,10 +20,15 @@ class CacheClient:
         self.settings = settings
         self.ttl = timedelta(hours=settings.ttl_hours)
 
+    @staticmethod
+    def _normalize_query(query: str) -> str:
+        """Normalise case and whitespace so trivially different spellings share a cache entry."""
+        return " ".join(query.lower().split())
+
     def _generate_cache_key(self, request: AskRequest) -> str:
         """Generate exact cache key based on request parameters."""
         key_data = {
-            "query": request.query,
+            "query": self._normalize_query(request.query),
             "model": request.model,
             "top_k": request.top_k,
             "use_hybrid": request.use_hybrid,
@@ -38,7 +44,8 @@ class CacheClient:
             cache_key = self._generate_cache_key(request)
 
             # Simple Redis GET operation - O(1)
-            cached_response = self.redis.get(cache_key)
+            # Sync Redis client: run in a worker thread so the event loop is not blocked
+            cached_response = await asyncio.to_thread(self.redis.get, cache_key)
 
             if cached_response:
                 try:
@@ -61,7 +68,7 @@ class CacheClient:
             cache_key = self._generate_cache_key(request)
 
             # Simple Redis SET operation with TTL
-            success = self.redis.set(cache_key, response.model_dump_json(), ex=self.ttl)
+            success = await asyncio.to_thread(self.redis.set, cache_key, response.model_dump_json(), ex=self.ttl)
 
             if success:
                 logger.info(f"Stored response in exact cache with key {cache_key[:16]}...")

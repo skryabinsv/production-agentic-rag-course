@@ -85,3 +85,19 @@ async def test_search_endpoint_all_parameters(client):
         assert "arxiv_id" in hit
         assert "title" in hit
         assert "score" in hit
+
+
+async def test_search_endpoint_fills_pdf_url_and_section(client):
+    response = await client.post("/api/v1/hybrid-search/", json={"query": "attention", "size": 1})
+
+    assert response.status_code == 200
+    hit = response.json()["hits"][0]
+    assert hit["pdf_url"] == "https://arxiv.org/pdf/1706.03762.pdf"
+    assert hit["section_name"] == "Introduction"
+
+
+async def test_search_endpoint_rerank_flag_without_reranker_is_noop(client):
+    response = await client.post("/api/v1/hybrid-search/", json={"query": "attention", "size": 1, "rerank": True})
+
+    assert response.status_code == 200
+    assert response.json()["search_mode"] == "hybrid"

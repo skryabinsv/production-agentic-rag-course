@@ -1,9 +1,9 @@
 """Tests for AgenticRAGService using LangGraph 2.0 Runtime pattern."""
 
-import pytest
 from unittest.mock import AsyncMock, Mock
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from src.services.agents.agentic_rag import AgenticRAGService
 from src.services.agents.config import GraphConfig
 from src.services.agents.models import GuardrailScoring
@@ -113,3 +113,84 @@ class TestAgenticRAGErrorHandling:
 
         with pytest.raises(Exception, match="Graph execution failed"):
             await test_service.ask(query="Test query")
+
+
+class _FakeStructuredLLM:
+    def __init__(self, schema, responses):
+        self.schema = schema
+        self.responses = responses
+
+    async def ainvoke(self, _prompt):
+        return self.responses[self.schema.__name__]
+
+
+class _FakeLLM:
+    """Deterministic stand-in for ChatOllama covering structured and plain calls."""
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.prompts = []
+
+    def with_structured_output(self, schema):
+        return _FakeStructuredLLM(schema, self.responses)
+
+    async def ainvoke(self, prompt):
+        self.prompts.append(prompt)
+        return AIMessage(content="Transformers rely on self-attention [arXiv:1706.03762].")
+
+
+class TestAgenticRAGEndToEnd:
+    """Runs the real compiled graph with fake LLM/search to cover the full Week 7 flow."""
+
+    @pytest.mark.asyncio
+    async def test_full_flow_returns_answer_sources_and_chunk_count(self, mock_opensearch_client, mock_jina_embeddings_client):
+        from src.services.agents.models import GradeDocuments
+
+        fake_llm = _FakeLLM(
+            {
+                "GuardrailScoring": GuardrailScoring(score=90, reason="research question"),
+                "GradeDocuments": GradeDocuments(binary_score="yes", reasoning="relevant"),
+            }
+        )
+        ollama = Mock()
+        ollama.get_langchain_model = Mock(return_value=fake_llm)
+
+        service = AgenticRAGService(
+            opensearch_client=mock_opensearch_client,
+            ollama_client=ollama,
+            embeddings_client=mock_jina_embeddings_client,
+            langfuse_tracer=None,
+            graph_config=GraphConfig(top_k=3),
+        )
+
+        result = await service.ask(query="What are transformers?", top_k=2, categories=["cs.CL"])
+
+        assert result["answer"].startswith("Transformers rely on self-attention")
+        assert result["sources"] == ["https://arxiv.org/pdf/1706.03762.pdf", "https://arxiv.org/pdf/1810.04805.pdf"]
+        assert result["chunks_used"] == 2
+        assert result["retrieval_attempts"] == 1
+        assert result["reasoning_steps"][-1] == "Generated answer from context"
+        # Per-request retrieval overrides reached OpenSearch
+        search_kwargs = mock_opensearch_client.search_unified.call_args.kwargs
+        assert search_kwargs["size"] == 2
+        assert search_kwargs["categories"] == ["cs.CL"]
+        # The generation prompt contains formatted, delimited context
+        assert "<document>" in fake_llm.prompts[-1]
+
+    @pytest.mark.asyncio
+    async def test_out_of_scope_question_is_rejected(self, mock_opensearch_client, mock_jina_embeddings_client):
+        fake_llm = _FakeLLM({"GuardrailScoring": GuardrailScoring(score=10, reason="not research")})
+        ollama = Mock()
+        ollama.get_langchain_model = Mock(return_value=fake_llm)
+        service = AgenticRAGService(
+            opensearch_client=mock_opensearch_client,
+            ollama_client=ollama,
+            embeddings_client=mock_jina_embeddings_client,
+        )
+
+        result = await service.ask(query="What is a good pizza recipe?")
+
+        assert "only help with questions about academic research papers" in result["answer"]
+        assert result["sources"] == []
+        assert result["reasoning_steps"][-1] == "Rejected as out of scope"
+        mock_opensearch_client.search_unified.assert_not_called()
