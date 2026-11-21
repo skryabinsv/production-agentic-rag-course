@@ -574,22 +574,6 @@ uv run pytest                 # Run tests
 
 ---
 
-<div align="center">
-  <h3>🎉 Ready to Start Your AI Engineering Journey?</h3>
-  <p><strong>Begin with the Week 1 setup notebook and build your first production RAG system!</strong></p>
-  
-  <p><em>For learners who want to master modern AI engineering</em></p>
-  <p><strong>Built with love by <a href="https://www.linkedin.com/in/shirin-khosravi-jam/">Shirin Khosravi Jam</a> & <a href="https://www.linkedin.com/in/shantanuladhwe/">Shantanu Ladhwe</a></strong></p>
-</div>
-
----
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=jamwithai/production-agentic-rag-course&type=Date)](https://star-history.com/#jamwithai/production-agentic-rag-course&Date)
-
----
-
 ## 📄 License
 
 MIT License - see [LICENSE](LICENSE) file for details.
